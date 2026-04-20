@@ -10,6 +10,7 @@ Classes:
 import os
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,8 +19,8 @@ load_dotenv()
 
 LMS_BASE_URL      = "https://pedagogy.cuonlineedu.in/api/v1"
 PROGRESS_BASE_URL = "https://learner-progress.cuonlineedu.in/api/v1"
-PROGRAM_ID        = 75
-BATCH_ID_FALLBACK = 839
+BATCH_ID_FALLBACK   = 839
+SEMESTER_ID_FALLBACK = 75
 
 
 # ─── LMS Client ───────────────────────────────────────────────────────────────
@@ -31,6 +32,7 @@ class LMSClient:
         self.token            = None
         self.user_id          = None
         self.program_batch_id = None
+        self.semester_id      = None
 
     def _headers(self, with_auth=True, with_content_type=False):
         headers = {
@@ -56,22 +58,8 @@ class LMSClient:
             resp.raise_for_status()
             data = resp.json()
 
-            self.token = (
-                data.get("token")
-                or data.get("accessToken")
-                or data.get("access_token")
-            )
-            self.user_id = (
-                data.get("userId")
-                or data.get("user_id")
-                or (data.get("user") or {}).get("id")
-                or (data.get("data") or {}).get("userId")
-            )
-            self.program_batch_id = (
-                data.get("programBatchId")
-                or (data.get("data") or {}).get("programBatchId")
-                or BATCH_ID_FALLBACK
-            )
+            self.token = data.get("token")
+            self.user_id = (data.get("user") or {}).get("id")
 
             if not self.token:
                 print(f"[ERROR] Could not extract token from response: {data}")
@@ -86,9 +74,65 @@ class LMSClient:
             print(f"[ERROR] Login request failed: {e}")
             return False
 
+    def get_user_info(self) -> bool:
+        """Fetch programBatchId for the logged-in user."""
+        url = f"{LMS_BASE_URL}/users/{self.user_id}"
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Response is a list — take the first item
+            info = data[0] if isinstance(data, list) and data else (
+                data if isinstance(data, dict) else {}
+            )
+
+            self.program_batch_id = info.get("programBatchId") or BATCH_ID_FALLBACK
+            return True
+
+        except requests.exceptions.HTTPError:
+            print(f"[WARN] Could not fetch user info (HTTP {resp.status_code}), using fallback.")
+            self.program_batch_id = BATCH_ID_FALLBACK
+            return False
+        except Exception as e:
+            print(f"[WARN] User info request failed: {e}. Using fallback.")
+            self.program_batch_id = BATCH_ID_FALLBACK
+            return False
+
+    def get_semester_id(self) -> bool:
+        """Fetch semesterId using programBatchId."""
+        url = f"{LMS_BASE_URL}/programbatchsemesters/{self.program_batch_id}?page=0&role=LEARNER&size=20"
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            items = data.get("data") or []
+            if not items:
+                print(f"[WARN] No semester found for programBatchId={self.program_batch_id}, using fallback.")
+                self.semester_id = SEMESTER_ID_FALLBACK
+                return False
+
+            # Pick the first active semester
+            semester = next(
+                (s for s in items if s.get("status") == "ACTIVE"),
+                items[0]
+            )
+            self.semester_id = semester.get("semesterId") or SEMESTER_ID_FALLBACK
+            return True
+
+        except requests.exceptions.HTTPError:
+            print(f"[WARN] Could not fetch semester (HTTP {resp.status_code}), using fallback.")
+            self.semester_id = SEMESTER_ID_FALLBACK
+            return False
+        except Exception as e:
+            print(f"[WARN] Semester fetch failed: {e}. Using fallback.")
+            self.semester_id = SEMESTER_ID_FALLBACK
+            return False
+
     def get_subjects(self) -> list:
         url = (
-            f"{LMS_BASE_URL}/users/subject/{PROGRAM_ID}"
+            f"{LMS_BASE_URL}/users/subject/{self.semester_id}"
             f"?programBatchId={self.program_batch_id}&userId={self.user_id}"
         )
         try:
@@ -286,18 +330,23 @@ class CLI:
             exit(1)
 
         print(f"\nLogging in as '{username}'...")
-
         if not self._lms.login(username, password):
             exit(1)
+        print(f"Login successful! userId={self._lms.user_id}")
 
-        print(f"Login successful! userId={self._lms.user_id}, programBatchId={self._lms.program_batch_id}")
+        print("Fetching user info...", end="", flush=True)
+        self._lms.get_user_info()
+        print(f" done. programBatchId={self._lms.program_batch_id}")
+
+        print("Fetching semester info...", end="", flush=True)
+        self._lms.get_semester_id()
+        print(f" done. semesterId={self._lms.semester_id}")
 
     # ── Module processing ─────────────────────────────────────────────────────
 
     def process_module(self, module: dict):
-        module_id   = module.get("id") or module.get("chapterId")
-        module_name = module.get("name") or module.get("title") or f"Module {module_id}"
-        chapter_id  = module_id
+        module_id   = module.get("id")
+        module_name = module.get("displayName") or f"Module {module_id}"
 
         print(f"\nFetching content for module: {module_name}...")
         contents = self._lms.get_content(module_id)
@@ -306,11 +355,7 @@ class CLI:
             print("  No video content found in this module.")
             return
 
-        content_ids = [
-            c.get("id") or c.get("contentId")
-            for c in contents
-            if c.get("id") or c.get("contentId")
-        ]
+        content_ids = [c.get("id") for c in contents if c.get("id")]
 
         print(f"  Fetching progress for {len(content_ids)} item(s)...", end="", flush=True)
         progress_map = self._progress.get_content_progress(content_ids)
@@ -320,21 +365,25 @@ class CLI:
         print(f"\n  {'#':<4} {'Progress':<20} Title")
         print(f"  {'-'*4} {'-'*20} {'-'*32}")
         for i, c in enumerate(contents, 1):
-            cid  = c.get("id") or c.get("contentId")
-            name = c.get("name") or c.get("title") or c.get("contentName") or f"Content {i}"
+            cid  = c.get("id")
+            name = c.get("title") or f"Content {i}"
             pct  = progress_map.get(int(cid), 0) if cid else 0
             print(f"  {i:<4} {self._progress_bar(pct)}  {name}")
 
-        # Summary
-        completed = sum(1 for cid in content_ids if progress_map.get(int(cid), 0) >= 100)
-        print(f"\n  Completed: {completed}/{len(contents)}")
+        # Split into pending (< 100%) and already done
+        pending    = [c for c in contents if c.get("id") and progress_map.get(int(c["id"]), 0) < 100]
+        done_count = len(contents) - len(pending)
 
-        if completed == len(contents):
-            print("  All videos already marked complete!")
-            if input("  Mark them all again anyway? (y/n): ").strip().lower() != "y":
-                return
+        print(f"\n  Completed: {done_count}/{len(contents)}")
 
-        print("\n  [1] Mark ALL as 100% complete")
+        if not pending:
+            print("  All videos already at 100% — nothing to mark.")
+            return
+
+        if done_count:
+            print(f"  Skipping {done_count} already-complete item(s).")
+
+        print("\n  [1] Mark ALL pending as 100% (parallel)")
         print("  [2] Mark one by one")
 
         while True:
@@ -343,24 +392,40 @@ class CLI:
                 break
             print("  Please enter 1 or 2.")
 
-        for i, content in enumerate(contents, 1):
-            content_id  = content.get("id") or content.get("contentId")
-            name        = content.get("name") or content.get("title") or content.get("contentName") or f"Content {i}"
-            current_pct = progress_map.get(int(content_id), 0) if content_id else 0
+        if mode == "1":
+            self._mark_parallel(pending, module_id)
+        else:
+            self._mark_one_by_one(pending, progress_map, module_id)
 
-            if mode == "2":
-                already = " ✓ already 100%" if current_pct >= 100 else f" ({int(current_pct)}%)"
-                confirm = input(f"\n  [{i}] '{name}'{already} — mark complete? (y/n): ").strip().lower()
-                if confirm != "y":
-                    print("  Skipped.")
-                    continue
+    def _mark_parallel(self, pending: list, module_id: int):
+        def _do(content):
+            cid   = content.get("id")
+            chid  = content.get("semesterSubjectChapterId") or module_id
+            name  = content.get("title") or f"Content {cid}"
+            ok, status = self._progress.mark_complete(cid, chid)
+            return name, ok, status
 
-            print(f"  Marking '{name}'... ", end="", flush=True)
-            success, status = self._progress.mark_complete(content_id, chapter_id)
-            print("Done ✓" if success else f"Failed ✗ (status: {status})")
+        print(f"\n  Marking {len(pending)} item(s) in parallel...\n")
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_do, c): c for c in pending}
+            for future in as_completed(futures):
+                name, ok, status = future.result()
+                print(f"  \u2713 {name}" if ok else f"  \u2717 {name} (status: {status})")
+        print("\n  All done.")
 
-            if mode == "1" and i < len(contents):
-                time.sleep(1.5)
+    def _mark_one_by_one(self, pending: list, progress_map: dict, module_id: int):
+        for i, content in enumerate(pending, 1):
+            cid        = content.get("id")
+            chid       = content.get("semesterSubjectChapterId") or module_id
+            name       = content.get("title") or f"Content {cid}"
+            current    = progress_map.get(int(cid), 0)
+            confirm    = input(f"\n  [{i}/{len(pending)}] '{name}' ({int(current)}%) — mark complete? (y/n): ").strip().lower()
+            if confirm != "y":
+                print("  Skipped.")
+                continue
+            print("  Marking... ", end="", flush=True)
+            ok, status = self._progress.mark_complete(cid, chid)
+            print("Done \u2713" if ok else f"Failed \u2717 (status: {status})")
 
     # ── Main flow ─────────────────────────────────────────────────────────────
 
@@ -375,25 +440,25 @@ class CLI:
             print("\nFetching your subjects...")
             subjects = self._lms.get_subjects()
 
-            subject = self._pick_from_list(subjects, "subjectName", "Select a Subject")
+            subject = self._pick_from_list(subjects, "name", "Select a Subject")
             if not subject:
                 print("No subjects available. Exiting.")
                 break
 
-            subject_id   = subject.get("id") or subject.get("subjectId")
-            subject_name = subject.get("subjectName") or subject.get("name") or f"Subject {subject_id}"
+            subject_id   = subject.get("id")
+            subject_name = subject.get("name") or f"Subject {subject_id}"
             print(f"\nSelected subject: {subject_name}")
 
             while True:
                 print("\nFetching modules...")
                 modules = self._lms.get_modules(subject_id)
 
-                module = self._pick_from_list(modules, "chapterName", "Select a Module")
+                module = self._pick_from_list(modules, "displayName", "Select a Module")
                 if not module:
                     print("No modules available.")
                     break
 
-                module_name = module.get("chapterName") or module.get("name") or "Selected Module"
+                module_name = module.get("displayName") or "Selected Module"
                 print(f"Selected module: {module_name}")
 
                 self.process_module(module)
