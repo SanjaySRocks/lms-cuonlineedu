@@ -1,0 +1,65 @@
+
+name: Mark Attendance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs every day at 08:00 AM IST (02:30 UTC)
+    - cron: '30 2 * * *'
+
+jobs:
+  mark-attendance:
+    name: Mark Attendance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Login and Mark Attendance
+        env:
+          LMS_USER: ${{ secrets.LMS_USER }}
+          LMS_PASS: ${{ secrets.LMS_PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Login
+          LOGIN_RESPONSE=$(curl -sS --fail-with-body -X POST \
+            "https://pedagogy.cuonlineedu.in/api/v1/auth/login" \
+            -H "content-type: application/json" \
+            -H "origin: https://lms.cuonlineedu.in" \
+            -H "referer: https://lms.cuonlineedu.in/" \
+            -H "user-agent: Mozilla/5.0" \
+            -d "$(jq -n --arg u "$LMS_USER" --arg p "$LMS_PASS" \
+              '{username:$u, email:null, password:$p}')")
+
+          # Extract Token and User ID
+          TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.token // .data.token // empty')
+          USER_ID=$(echo "$LOGIN_RESPONSE" | jq -r '.user.id // .data.user.id // empty')
+
+          if [[ -z "$TOKEN" || -z "$USER_ID" ]]; then
+            echo "Login failed: token or userId missing"
+            exit 1
+          fi
+
+          echo "Login successful"
+
+          # Mark Attendance
+          ATTENDANCE_RESPONSE=$(curl -sS --fail-with-body -X POST \
+            "https://pedagogy.cuonlineedu.in/api/v1/attendance" \
+            -H "content-type: application/json" \
+            -H "origin: https://lms.cuonlineedu.in" \
+            -H "referer: https://lms.cuonlineedu.in/" \
+            -H "user-agent: Mozilla/5.0" \
+            -H "authorization: Bearer $TOKEN" \
+            -d "$(jq -n --arg id "$USER_ID" \
+              '{userId:$id, attendanceStatus:1}')")
+
+          echo "Attendance API response:"
+          echo "$ATTENDANCE_RESPONSE" | jq .
