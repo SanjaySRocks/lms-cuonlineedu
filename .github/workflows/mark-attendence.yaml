@@ -50,6 +50,7 @@ jobs:
 
           echo "Login successful"
 
+          
           # Mark Attendance
           ATTENDANCE_RESPONSE=$(curl -sS --fail-with-body -X POST \
             "https://pedagogy.cuonlineedu.in/api/v1/attendance" \
@@ -60,6 +61,14 @@ jobs:
             -H "authorization: Bearer $TOKEN" \
             -d "$(jq -n --arg id "$USER_ID" \
               '{userId:$id, attendanceStatus:1}')")
-
+          
           echo "Attendance API response:"
-          echo "$ATTENDANCE_RESPONSE" | jq .
+          
+          if echo "$ATTENDANCE_RESPONSE" | jq -e . >/dev/null 2>&1; then
+              echo "$ATTENDANCE_RESPONSE" | jq .
+          else
+              echo "$ATTENDANCE_RESPONSE"
+          fi
+          
+          echo "Attendance API request completed."
+
