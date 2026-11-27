@@ -4,8 +4,8 @@ name: Mark Attendance
 on:
   workflow_dispatch:
   schedule:
-    - cron: '48 9 * * *'
-      timezone: 'Asia/Kolkata'
+    - cron: '57 9 * * *'
+      timezone: "Asia/Kolkata"
 
 jobs:
   mark-attendance:
