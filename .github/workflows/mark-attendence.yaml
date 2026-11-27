@@ -4,7 +4,8 @@ name: Mark Attendance
 on:
   workflow_dispatch:
   schedule:
-    - cron: '35 4 * * *'
+    # 9 AM IST
+    - cron: '30 3 * * *'
 
 jobs:
   mark-attendance:
